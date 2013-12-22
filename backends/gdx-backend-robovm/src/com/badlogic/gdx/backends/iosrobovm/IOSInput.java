@@ -16,9 +16,7 @@
 
 package com.badlogic.gdx.backends.iosrobovm;
 
-import com.badlogic.gdx.graphics.Pixmap;
 import org.robovm.cocoatouch.coregraphics.CGPoint;
-import org.robovm.cocoatouch.foundation.NSArray;
 import org.robovm.cocoatouch.foundation.NSSet;
 import org.robovm.cocoatouch.uikit.UIAcceleration;
 import org.robovm.cocoatouch.uikit.UIAccelerometer;
@@ -32,19 +30,27 @@ import org.robovm.cocoatouch.uikit.UIInterfaceOrientation;
 import org.robovm.cocoatouch.uikit.UITextField;
 import org.robovm.cocoatouch.uikit.UITouch;
 import org.robovm.cocoatouch.uikit.UITouchPhase;
-import org.robovm.cocoatouch.uikit.UIView;
 import org.robovm.objc.ObjCClass;
+import org.robovm.objc.Selector;
+import org.robovm.rt.bro.Bro;
+import org.robovm.rt.bro.annotation.Bridge;
+import org.robovm.rt.bro.annotation.ByVal;
+import org.robovm.rt.bro.annotation.Library;
+import org.robovm.rt.bro.annotation.Pointer;
 
 import com.badlogic.gdx.Input;
 import com.badlogic.gdx.InputProcessor;
+import com.badlogic.gdx.graphics.Pixmap;
 import com.badlogic.gdx.utils.Array;
 import com.badlogic.gdx.utils.GdxRuntimeException;
 import com.badlogic.gdx.utils.Pool;
 
+@Library("objc")
 public class IOSInput implements Input {
 	static final int MAX_TOUCHES = 20;
 
 	static {
+		Bro.bind(IOSInput.class);
 		// HACK: Make sure UITouch has been registered
 		ObjCClass.getByType(UITouch.class);
 	}
@@ -407,28 +413,51 @@ public class IOSInput implements Input {
 		throw new GdxRuntimeException("Couldn't find free pointer id!");
 	}
 	
-	private int findPointer(UITouch touch) {
-		long ptr = touch.getHandle();
+	private int findPointer(long ptr) {
 		for(int i = 0; i < touchDown.length; i++) {
 			if(touchDown[i] == ptr) return i;
 		}
 		throw new GdxRuntimeException("Couldn't find pointer id for touch event!");
 	}
 
+	private static final Selector selObjectEnumerator = Selector.register("objectEnumerator");
+	@Bridge(symbol = "objc_msgSend") private native static @Pointer long objc_objectEnumerator(NSSet __self__, Selector __cmd__);
+	private static final Selector selNextObject = Selector.register("nextObject");
+	@Bridge(symbol = "objc_msgSend") private native static @Pointer long objc_nextObject(@Pointer long __self__, Selector __cmd__);
+	private static final Selector selView = Selector.register("view");
+	@Bridge(symbol = "objc_msgSend") private native static @Pointer long objc_getView(@Pointer long __self__, Selector __cmd__);
+	private static final Selector selLocationInView$ = Selector.register("locationInView:");
+	@Bridge(symbol = "objc_msgSend") private native static @ByVal CGPoint objc_getLocation(@Pointer long __self__, Selector __cmd__, @Pointer long view);
+	@Bridge(symbol = "objc_msgSend_stret") private native static @ByVal CGPoint objc_getLocation_stret(@Pointer long __self__, Selector __cmd__, @Pointer long view);
+	private static final Selector selPhase = Selector.register("phase");
+	@Bridge(symbol = "objc_msgSend") private native static UITouchPhase objc_getPhase(@Pointer long __self__, Selector __cmd__);
+	private static final Selector selTimestamp = Selector.register("timestamp");
+	@Bridge(symbol = "objc_msgSend") private native static double objc_getTimestamp(@Pointer long __self__, Selector __cmd__);
+	
+	private static final boolean IS_ARM = Bro.IS_ARM;
+	
 	private void toTouchEvents(NSSet touches, UIEvent uiEvent) {
-		for (UITouch touch : (NSSet<UITouch>) touches) {
-			CGPoint loc = touch.getLocation(touch.getView());
+		long enumerator = objc_objectEnumerator(touches, selObjectEnumerator);
+		long touch = objc_nextObject(enumerator, selNextObject);
+		while (touch != 0L) {
+			UITouchPhase phase = objc_getPhase(touch, selPhase);
+			CGPoint loc = null;
+			if (IS_ARM) {
+				loc = objc_getLocation_stret(touch, selLocationInView$, objc_getView(touch, selView));
+			} else {
+				loc = objc_getLocation(touch, selLocationInView$, objc_getView(touch, selView));
+			}
 			synchronized(touchEvents) {
 				TouchEvent event = touchEventPool.obtain();
 				event.x = (int)(loc.x() * app.displayScaleFactor);
 				event.y = (int)(loc.y() * app.displayScaleFactor);
-				event.phase = touch.getPhase();
-				event.timestamp = (long)(touch.getTimestamp() * 1000000000);
+				event.phase = phase;
+				event.timestamp = (long)(objc_getTimestamp(touch, selTimestamp) * 1000000000);
 				touchEvents.add(event);
 				
-				if(touch.getPhase() == UITouchPhase.Began) {					
+				if(phase == UITouchPhase.Began) {					
 					event.pointer = getFreePointer();
-					touchDown[event.pointer] = (int) touch.getHandle();
+					touchDown[event.pointer] = (int) touch;
 					touchX[event.pointer] = event.x;
 					touchY[event.pointer] = event.y;
 					deltaX[event.pointer] = 0;
@@ -436,8 +465,8 @@ public class IOSInput implements Input {
 					numTouched++;
 				}
 				
-				if(touch.getPhase() == UITouchPhase.Moved ||
-					touch.getPhase() == UITouchPhase.Stationary) {
+				if(phase == UITouchPhase.Moved ||
+						phase == UITouchPhase.Stationary) {
 					event.pointer = findPointer(touch);
 					deltaX[event.pointer] = event.x - touchX[event.pointer];
 					deltaY[event.pointer] = event.y - touchY[event.pointer]; 
@@ -445,8 +474,8 @@ public class IOSInput implements Input {
 					touchY[event.pointer] = event.y;
 				}
 				
-				if(touch.getPhase() == UITouchPhase.Cancelled ||
-					touch.getPhase() == UITouchPhase.Ended) {					
+				if(phase == UITouchPhase.Cancelled ||
+						phase == UITouchPhase.Ended) {					
 					event.pointer = findPointer(touch);
 					touchDown[event.pointer] = 0; 
 					touchX[event.pointer] = event.x;
@@ -455,6 +484,7 @@ public class IOSInput implements Input {
 					deltaY[event.pointer] = 0;
 					numTouched--;
 				}
+				touch = objc_nextObject(enumerator, selNextObject);
 			}
 		}
 	}
